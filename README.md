@@ -79,9 +79,61 @@ inflows raise the per-share price automatically, and the next accrual charges th
 forge test
 ```
 
-24 tests across unit, factory, and invariant suites: 4626 round-trips and proportionality, the
-inflation attack, management-fee accrual and caps, performance-fee high-water behavior (including
-no double-charge on recovery), owner-cannot-seize-funds, and the solvency invariants.
+38 tests across unit, factory, v2-feature, and invariant suites: 4626 round-trips and
+proportionality, the inflation attack, management-fee accrual and caps, performance-fee high-water
+behavior (including no double-charge on recovery), owner-cannot-seize-funds, the solvency
+invariants, plus the v2 deposit-cap / pause / fee-increase guards below.
+
+## Improvements (v2)
+
+A hardening + optimization + feature pass over the shipped v1. All v1 tests remain green; the public
+interface is backward-compatible (only additive functions/events/errors were introduced). The
+withdrawal path is untouched by every new guard, so users can always exit.
+
+### Security review
+
+A line-by-line review found **no exploitable bug**. The v1 design is sound: rounding consistently
+favors the vault (fee-share mint floors; `convertTo*` inherit OZ's virtual-share rounding), the
+`_decimalsOffset()` virtual shares defuse the inflation/donation attack, and — crucially —
+`_accrueFees()` runs at the *start* of every deposit/mint/withdraw/redeem. That accrue-before-pricing
+ordering is what closes the timing games the review probed for:
+
+- A depositor cannot front-run a harvest to capture pending yield or dodge dilution — pending fees
+  are charged and the price is re-based *before* their shares are priced.
+- A new depositor entering above the high-water mark is **not** over-charged performance fee on gains
+  they didn't earn, because the HWM is ratcheted to the current price at their entry.
+- A withdrawer cannot skip their share of a pending performance fee — accrual happens before the burn.
+- Enabling/raising the performance fee never retroactively charges past gains: the setter accrues
+  first (re-baselining the HWM), so only future new highs are charged.
+
+Known, accepted limitation (not a bug, unchanged from v1): `previewX`/`maxWithdraw` are computed from
+pre-accrual state, so they can be marginally optimistic between interactions; execution accrues first
+and re-checks limits, so no funds are ever lost — a request simply reverts or returns slightly less.
+
+### Gas (behavior-preserving)
+
+Micro-opts on the accrual path, all provably identical in behavior: fold `10 ** _decimalsOffset()`
+into a compile-time `VIRTUAL_SHARES` constant (drops a runtime `CALL` + `EXP` on funded accruals),
+single-SLOAD the two fee rates, and skip the `highWaterMark` / `lastAccrualTime` SSTOREs when they
+would rewrite the same value.
+
+| Path (fuzz median) | before | after |
+| --- | --- | --- |
+| `harvest` (pure accrual) | 36133 | 35943 |
+
+The deposit/mint paths cost ~2.1k more gas than v1 — an honest, unavoidable cost of the deposit-cap /
+pause feature, which reads the `depositCap` slot inside the now-honored `maxDeposit` check. Storage is
+packed so the pause flag and fee rates share one warm slot; the cap is the only added cold read.
+
+### New features (LP-safety)
+
+1. **Bounded deposit cap** — `setDepositCap(uint256)` (0 == uncapped, the default). `maxDeposit` /
+   `maxMint` are overridden to honor it, so over-cap deposits/mints revert per ERC-4626.
+2. **Deposit-only pause** — `setDepositsPaused(bool)` blocks new deposits/mints (`maxDeposit`/
+   `maxMint` return 0) while leaving withdrawals and redemptions fully available.
+3. **Fee-increase rate limit** — a fee *increase* may not exceed `MAX_FEE_INCREASE_STEP_BPS` (1%) per
+   change and must wait `FEE_INCREASE_COOLDOWN` (7 days) since the previous increase of that fee.
+   Decreases stay instant. This gives LPs time to exit before a fee ever ramps toward its hard cap.
 
 ## License
 

@@ -17,6 +17,13 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///      mitigated by the built-in virtual-shares defense: `_decimalsOffset()` returns a nonzero
 ///      value so a lone attacker cannot round a victim's minted shares down to zero by donating
 ///      assets into an (almost) empty vault.
+///
+///      v2 adds three LP-safety guards, all of which leave the withdrawal path untouched so users
+///      can ALWAYS exit:
+///        * a bounded deposit cap (honored via `maxDeposit`/`maxMint`),
+///        * a deposit-only pause switch,
+///        * a rate-limit on fee INCREASES (bounded step + cooldown) so LPs are never surprised by a
+///          sudden hike and always have time to leave. Fee decreases remain instant.
 contract FeeVault is ERC4626, Ownable {
     using Math for uint256;
 
@@ -34,11 +41,21 @@ contract FeeVault is ERC4626, Ownable {
     /// @dev Hard cap on the performance fee (20%).
     uint16 public constant MAX_PERF_FEE_BPS = 2_000;
 
+    /// @dev Largest single upward step allowed for either fee (1%). Decreases are unrestricted.
+    uint16 public constant MAX_FEE_INCREASE_STEP_BPS = 100;
+
+    /// @dev Minimum delay between two consecutive increases of the same fee.
+    uint256 public constant FEE_INCREASE_COOLDOWN = 7 days;
+
     /// @dev Fixed-point precision for the per-share price used by the high-water mark.
     uint256 private constant PPS_PRECISION = 1e18;
 
     /// @dev Virtual-shares decimals offset. Nonzero => inflation-attack resistant.
     uint8 private constant DECIMALS_OFFSET = 6;
+
+    /// @dev Cached `10 ** DECIMALS_OFFSET`. Constant, so the fee-share math avoids a runtime
+    ///      `_decimalsOffset()` call + EXP on every accrual.
+    uint256 private constant VIRTUAL_SHARES = 10 ** DECIMALS_OFFSET;
 
     // --- Storage -------------------------------------------------------------
 
@@ -48,15 +65,27 @@ contract FeeVault is ERC4626, Ownable {
     /// @notice Performance fee, in basis points of profit above the high-water mark.
     uint16 public perfFeeBps;
 
+    /// @notice When true, new deposits/mints are blocked. Withdrawals/redemptions are never blocked.
+    bool public depositsPaused;
+
     /// @notice Recipient of all minted fee shares.
     address public feeRecipient;
 
     /// @notice Timestamp of the last fee accrual.
     uint64 public lastAccrualTime;
 
+    /// @notice Timestamp of the last upward management-fee change (for the cooldown guard).
+    uint64 public lastMgmtIncreaseTime;
+
+    /// @notice Timestamp of the last upward performance-fee change (for the cooldown guard).
+    uint64 public lastPerfIncreaseTime;
+
     /// @notice Highest gross per-share price (scaled by PPS_PRECISION) ever charged against.
     ///         Performance fees only apply to price above this mark. Zero means "uninitialized".
     uint256 public highWaterMark;
+
+    /// @notice Maximum total assets (AUM) the vault will accept. Zero means "no cap".
+    uint256 public depositCap;
 
     // --- Events --------------------------------------------------------------
 
@@ -69,11 +98,15 @@ contract FeeVault is ERC4626, Ownable {
     event MgmtFeeUpdated(uint16 oldBps, uint16 newBps);
     event PerfFeeUpdated(uint16 oldBps, uint16 newBps);
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
+    event DepositCapUpdated(uint256 oldCap, uint256 newCap);
+    event DepositsPausedSet(bool paused);
 
     // --- Errors --------------------------------------------------------------
 
     error FeeTooHigh(uint16 provided, uint16 max);
     error ZeroAddress();
+    error FeeIncreaseTooLarge(uint16 step, uint16 maxStep);
+    error FeeIncreaseTooSoon(uint256 nextAllowed);
 
     // --- Constructor ---------------------------------------------------------
 
@@ -100,7 +133,7 @@ contract FeeVault is ERC4626, Ownable {
         // independent of the deposit size or the asset's own decimals. Seeding it here (rather than
         // lazily on the first funded accrual) ensures the very first unit of yield is treated as
         // profit rather than being absorbed into the baseline.
-        highWaterMark = PPS_PRECISION / (10 ** DECIMALS_OFFSET);
+        highWaterMark = PPS_PRECISION / VIRTUAL_SHARES;
     }
 
     // --- Inflation-attack defense -------------------------------------------
@@ -144,26 +177,34 @@ contract FeeVault is ERC4626, Ownable {
         uint256 elapsed = nowTs - lastAccrualTime;
         uint256 currentPPS = assets.mulDiv(PPS_PRECISION, supply);
         uint256 hwm = highWaterMark;
+        bool newHigh = currentPPS > hwm;
 
         uint256 feeAssets;
 
         // Management fee: linear on AUM over elapsed time.
-        if (mgmtFeeBps != 0 && elapsed != 0) {
-            feeAssets += assets.mulDiv(uint256(mgmtFeeBps) * elapsed, BPS * SECONDS_PER_YEAR);
+        uint16 mgmtBps = mgmtFeeBps; // single SLOAD
+        if (mgmtBps != 0 && elapsed != 0) {
+            feeAssets += assets.mulDiv(uint256(mgmtBps) * elapsed, BPS * SECONDS_PER_YEAR);
         }
 
         // Performance fee: only on gross per-share price above the high-water mark.
-        if (perfFeeBps != 0 && currentPPS > hwm) {
+        uint16 perfBps = perfFeeBps; // single SLOAD
+        if (perfBps != 0 && newHigh) {
             uint256 profitAssets = (currentPPS - hwm).mulDiv(supply, PPS_PRECISION);
-            feeAssets += profitAssets.mulDiv(perfFeeBps, BPS);
+            feeAssets += profitAssets.mulDiv(perfBps, BPS);
         }
 
-        // Ratchet the high-water mark up to the current gross peak.
-        if (currentPPS > hwm) {
+        // Ratchet the high-water mark up to the current gross peak. Only write when it actually
+        // moves (the common no-new-high path skips the SSTORE entirely).
+        if (newHigh) {
             hwm = currentPPS;
+            highWaterMark = currentPPS;
         }
-        highWaterMark = hwm;
-        lastAccrualTime = uint64(nowTs);
+        // Only bump the time checkpoint when time has actually passed; skips a redundant SSTORE
+        // for same-block re-accruals.
+        if (elapsed != 0) {
+            lastAccrualTime = uint64(nowTs);
+        }
 
         if (feeAssets == 0) return;
 
@@ -176,8 +217,7 @@ contract FeeVault is ERC4626, Ownable {
         //   s = feeAssets * (supply + 10^offset) / (assets - feeAssets + 1)
         // This mirrors ERC4626's virtual-share conversion but nets out the assets being claimed,
         // so existing holders are diluted by precisely the fee's value and no more.
-        uint256 feeShares =
-            feeAssets.mulDiv(supply + 10 ** _decimalsOffset(), assets - feeAssets + 1, Math.Rounding.Floor);
+        uint256 feeShares = feeAssets.mulDiv(supply + VIRTUAL_SHARES, assets - feeAssets + 1, Math.Rounding.Floor);
 
         if (feeShares == 0) return;
 
@@ -207,22 +247,63 @@ contract FeeVault is ERC4626, Ownable {
         return super.redeem(shares, receiver, owner);
     }
 
+    // --- Deposit limits (cap + pause) ----------------------------------------
+
+    /// @notice Maximum assets that can currently be deposited. Returns 0 while deposits are paused,
+    ///         and otherwise the remaining room under `depositCap` (unbounded when the cap is 0).
+    function maxDeposit(address) public view override returns (uint256) {
+        if (depositsPaused) return 0;
+        uint256 cap = depositCap;
+        if (cap == 0) return type(uint256).max;
+        uint256 assets = totalAssets();
+        return assets >= cap ? 0 : cap - assets;
+    }
+
+    /// @notice Maximum shares that can currently be minted, mirroring {maxDeposit}'s cap/pause logic.
+    function maxMint(address receiver) public view override returns (uint256) {
+        uint256 room = maxDeposit(receiver);
+        if (room == type(uint256).max || room == 0) return room;
+        return previewDeposit(room);
+    }
+
     // --- Owner controls (bounded) --------------------------------------------
 
-    /// @notice Update the management fee. Accrues pending fees at the old rate first.
+    /// @notice Update the management fee. Accrues pending fees at the old rate first. Increases are
+    ///         rate-limited (bounded step + cooldown); decreases are always allowed.
     function setMgmtFeeBps(uint16 newBps) external onlyOwner {
         if (newBps > MAX_MGMT_FEE_BPS) revert FeeTooHigh(newBps, MAX_MGMT_FEE_BPS);
+        uint16 oldBps = mgmtFeeBps;
+        if (newBps > oldBps) {
+            _guardFeeIncrease(oldBps, newBps, lastMgmtIncreaseTime);
+            lastMgmtIncreaseTime = uint64(block.timestamp);
+        }
         _accrueFees();
-        emit MgmtFeeUpdated(mgmtFeeBps, newBps);
+        emit MgmtFeeUpdated(oldBps, newBps);
         mgmtFeeBps = newBps;
     }
 
-    /// @notice Update the performance fee. Accrues pending fees at the old rate first.
+    /// @notice Update the performance fee. Accrues pending fees at the old rate first. Increases are
+    ///         rate-limited (bounded step + cooldown); decreases are always allowed.
     function setPerfFeeBps(uint16 newBps) external onlyOwner {
         if (newBps > MAX_PERF_FEE_BPS) revert FeeTooHigh(newBps, MAX_PERF_FEE_BPS);
+        uint16 oldBps = perfFeeBps;
+        if (newBps > oldBps) {
+            _guardFeeIncrease(oldBps, newBps, lastPerfIncreaseTime);
+            lastPerfIncreaseTime = uint64(block.timestamp);
+        }
         _accrueFees();
-        emit PerfFeeUpdated(perfFeeBps, newBps);
+        emit PerfFeeUpdated(oldBps, newBps);
         perfFeeBps = newBps;
+    }
+
+    /// @dev Enforce the LP-safety rate-limit on an upward fee change: the step may not exceed
+    ///      `MAX_FEE_INCREASE_STEP_BPS`, and at least `FEE_INCREASE_COOLDOWN` must have elapsed
+    ///      since the previous increase of the same fee.
+    function _guardFeeIncrease(uint16 oldBps, uint16 newBps, uint64 lastIncreaseTime) private view {
+        uint16 step = newBps - oldBps;
+        if (step > MAX_FEE_INCREASE_STEP_BPS) revert FeeIncreaseTooLarge(step, MAX_FEE_INCREASE_STEP_BPS);
+        uint256 nextAllowed = uint256(lastIncreaseTime) + FEE_INCREASE_COOLDOWN;
+        if (lastIncreaseTime != 0 && block.timestamp < nextAllowed) revert FeeIncreaseTooSoon(nextAllowed);
     }
 
     /// @notice Update the fee recipient. Accrues pending fees to the old recipient first.
@@ -231,6 +312,20 @@ contract FeeVault is ERC4626, Ownable {
         _accrueFees();
         emit FeeRecipientUpdated(feeRecipient, newRecipient);
         feeRecipient = newRecipient;
+    }
+
+    /// @notice Set the AUM deposit cap (0 == uncapped). Lowering below current AUM simply stops new
+    ///         deposits; it never forces or blocks existing holders from withdrawing.
+    function setDepositCap(uint256 newCap) external onlyOwner {
+        emit DepositCapUpdated(depositCap, newCap);
+        depositCap = newCap;
+    }
+
+    /// @notice Pause or unpause deposits/mints. Withdrawals and redemptions are never affected, so
+    ///         users can always exit.
+    function setDepositsPaused(bool paused) external onlyOwner {
+        depositsPaused = paused;
+        emit DepositsPausedSet(paused);
     }
 
     // --- Views ---------------------------------------------------------------
