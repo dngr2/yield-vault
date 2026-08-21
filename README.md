@@ -58,8 +58,8 @@ All owner controls are `onlyOwner` and bounded by the on-chain hard caps above.
 
 ## Security & testing
 
-`forge test` runs **38 tests** across four suites — unit, factory, LP-safety, and a stateful invariant
-suite — all passing.
+`forge test` runs **41 tests** across five suites — unit, factory, LP-safety, a stateful invariant
+suite, and a catastrophic-loss triage — all passing.
 
 - **Solvency invariants.** `test/FeeVaultInvariant.t.sol` drives a bounded handler over the full
   lifecycle (deposit / mint / withdraw / redeem / external yield / loss / time passage) and asserts:
@@ -79,6 +79,15 @@ suite — all passing.
   the fee-share mint from floor to ceil rounding (it shifts one unit toward the fee recipient but does
   not break the solvency invariant), and tightening the management-fee cap check from `>` to `>=` (a
   boundary case — no test sets a fee exactly at the hard cap).
+
+- **Catastrophic-loss share math (triaged).** `test/SharePriceOverflowTriage.t.sol` reproduces the
+  degenerate state where the vault loses nearly all assets (`totalAssets == 1`) while `totalSupply`
+  stays ~1e36. In that state a realistic deposit still mints shares and remains redeemable, and even a
+  ~1e6-token deposit succeeds. Only an astronomically large single deposit (~1e30 tokens) reverts, and
+  that revert is OpenZeppelin `mulDiv` correctly refusing to mint more shares than a `uint256` can
+  represent — it changes no state and moves no funds. This is safe refusal of an impossible mint, not a
+  loss of funds; the precondition is a near-total loss that is not expected to be reachable in normal
+  operation. Documented rather than "fixed" because the behavior is correct.
 
 Gas, from this repo's own `forge test --gas-report` (fuzz medians): `harvest` ≈ 35.9k,
 `deposit` ≈ 66.3k, `redeem` ≈ 63.0k.
