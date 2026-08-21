@@ -6,5 +6,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge fmt --check
       - run: forge build
       - run: forge test -vv
