@@ -1,140 +1,138 @@
-# FeeVault — ERC-4626 tokenized vault with management + performance fees
+# FeeVault — a safe ERC-4626 fee vault
 
-A production-oriented [ERC-4626](https://eips.ethereum.org/EIPS/eip-4626) tokenized vault built on
-OpenZeppelin's audited `ERC4626`. Users deposit an underlying ERC-20 asset and receive vault shares
-(themselves an ERC-20). The vault earns a **bounded management fee** on assets under management and a
-**bounded performance fee** on yield above a **per-share high-water mark**. Fees are the revenue layer.
+An [ERC-4626](https://eips.ethereum.org/EIPS/eip-4626) tokenized vault with a built-in fee layer,
+meant as a base that vault operators and protocols can deploy for their LPs without re-solving the
+sharp edges of 4626. Depositors put in an ERC-20 asset and receive vault shares; the operator earns a
+bounded management fee on assets under management and a bounded performance fee on yield above a
+high-water mark. Built on OpenZeppelin v5's audited `ERC4626`.
+
+## Why this one
+
+Most ERC-4626 pain is not the interface — it is the accounting around it. FeeVault's edge is that the
+known failure modes are closed by construction, and that LPs keep the upper hand over the operator:
+
+- **First-depositor inflation attack is defended.** `_decimalsOffset()` returns `6`, so the vault runs
+  with `10^6` virtual shares and a virtual asset. An attacker who seeds an empty vault and donates
+  assets to inflate the share price cannot round a later depositor's shares to zero — they would have
+  to donate on the order of `10^6 ×` the value they hope to steal, and rounding still favors the vault.
+- **The high-water performance fee never double-charges a recovery.** The mark is a per-share price
+  that only ratchets up. After a drawdown, yield that merely climbs back to the prior peak pays no
+  performance fee; only genuinely new highs are charged.
+- **Fees are share dilution only — there is no admin path to principal.** Fees are realized by minting
+  vault shares to the fee recipient, which redeem pro-rata like anyone else's. No function lets the
+  owner pull user assets out of the vault.
+- **Fee increases are rate-limited and LPs can always exit.** An increase is capped at 1% (100 bps)
+  per step with a 7-day cooldown, so a fee can never jump to its hard cap without warning. Deposits can
+  be paused, but the withdraw/redeem path is never gated — holders can leave at any time.
+
+These properties are backed by a stateful solvency invariant and a mutation-testing pass over the fee
+and safety logic (below), not just example-based tests.
+
+## Fees
+
+Fee accrual runs at the start of every `deposit`/`mint`/`withdraw`/`redeem` — before shares are priced,
+so previews and execution observe the same post-fee state — and can also be triggered on its own with
+`harvest()`.
+
+- **Management fee** — linear in time and AUM: `totalAssets * mgmtFeeBps/10_000 * elapsed/365 days`.
+  Hard-capped at `MAX_MGMT_FEE_BPS = 500` (5% annual).
+- **Performance fee** — `perfFeeBps` of the profit represented by the per-share price rising above the
+  high-water mark, times supply. Hard-capped at `MAX_PERF_FEE_BPS = 2000` (20%). The mark is seeded at
+  the fresh-vault price and only ever ratchets up.
+
+Yield reaches the vault as assets flowing in (a strategy returning profit; in tests, a direct transfer
+via `MockYieldSource`). Because `totalAssets()` reads the vault's asset balance, inflows raise the
+per-share price and the next accrual charges the performance fee on the new high.
+
+### LP-safety controls
+
+- **Deposit cap** — `setDepositCap(uint256)` bounds AUM (0 == uncapped, the default). `maxDeposit` /
+  `maxMint` honor it, so over-cap deposits revert per ERC-4626. Lowering it never blocks withdrawals.
+- **Deposit-only pause** — `setDepositsPaused(bool)` blocks new deposits and mints while leaving
+  withdrawals and redemptions fully available.
+- **Fee-increase rate limit** — an increase to either fee may not exceed `MAX_FEE_INCREASE_STEP_BPS`
+  (1%) per change and must wait `FEE_INCREASE_COOLDOWN` (7 days) since the previous increase of that
+  fee. Decreases are always instant.
+
+All owner controls are `onlyOwner` and bounded by the on-chain hard caps above.
+
+## Security & testing
+
+`forge test` runs **38 tests** across four suites — unit, factory, LP-safety, and a stateful invariant
+suite — all passing.
+
+- **Solvency invariants.** `test/FeeVaultInvariant.t.sol` drives a bounded handler over the full
+  lifecycle (deposit / mint / withdraw / redeem / external yield / loss / time passage) and asserts:
+  - `invariant_solvent` — the assets owed to every shareholder at the current price never exceed the
+    assets the vault holds.
+  - `invariant_shareAccountingComplete` — the sum of all share balances (actors + fee recipient)
+    equals `totalSupply()`; shares are never minted anywhere else.
+  - `invariant_totalClaimBounded` — `convertToAssets(totalSupply())` never exceeds `totalAssets()`.
+- **Inflation attack.** `test_InflationAttack_VictimNotRobbed` runs the full first-depositor donation
+  attack and asserts the victim recovers essentially all of their deposit while the attacker cannot
+  profit.
+- **Mutation-tested.** The fee and safety logic was checked by deliberately corrupting it and
+  confirming the suite fails. Caught mutants include: forcing the high-water comparison to always
+  charge, zeroing the decimals offset, dropping `SECONDS_PER_YEAR` from the management-fee denominator,
+  dropping the supply factor from the performance fee, having the pause return "unlimited" instead of
+  zero, and disabling the fee-increase step guard. Two mutants survive and are noted honestly: flipping
+  the fee-share mint from floor to ceil rounding (it shifts one unit toward the fee recipient but does
+  not break the solvency invariant), and tightening the management-fee cap check from `>` to `>=` (a
+  boundary case — no test sets a fee exactly at the hard cap).
+
+Gas, from this repo's own `forge test --gas-report` (fuzz medians): `harvest` ≈ 35.9k,
+`deposit` ≈ 66.3k, `redeem` ≈ 63.0k.
 
 ## Contracts
 
-- **`src/FeeVault.sol`** — the vault. Standard 4626 `deposit`/`mint`/`withdraw`/`redeem`, plus fee
-  accrual, high-water tracking, and bounded owner controls.
-- **`src/VaultFactory.sol`** — deploys and indexes `FeeVault` instances, with an optional bounded
-  flat creation fee paid to the factory's own fee recipient.
+- **`src/FeeVault.sol`** — the vault: standard 4626 `deposit`/`mint`/`withdraw`/`redeem`, fee accrual,
+  high-water tracking, and the bounded owner controls.
+- **`src/VaultFactory.sol`** — deploys and indexes `FeeVault` instances, with an optional bounded flat
+  creation fee (in the vault's asset) paid to the factory's own recipient. The deployed vault is owned
+  by its creator.
 
-## Inflation-attack defense
+## Usage
 
-The classic first-depositor / donation ("inflation") attack seeds an empty vault with 1 wei, donates
-a large amount of the asset directly into the vault to inflate the share price, and thereby rounds a
-later victim's minted shares down toward zero — capturing the victim's deposit.
+Deploy a vault through the factory, then deposit and withdraw with the standard 4626 API:
 
-`FeeVault` uses OpenZeppelin v5's built-in **virtual shares / decimals-offset** defense:
-`_decimalsOffset()` returns `6`. The conversion math becomes
-`shares = assets * (totalSupply + 10^6) / (totalAssets + 1)`, so the virtual `10^6` shares and `+1`
-virtual asset mean an attacker must donate on the order of `10^6 ×` the value they hope to steal, and
-even then rounding favors the vault rather than the attacker. The test
-`test_InflationAttack_VictimNotRobbed` drives the full attack and asserts the victim recovers
-essentially all of their deposit while the attacker cannot profit.
+```solidity
+// Factory: owner, recipient of creation fees, flat creation fee (0 == none).
+VaultFactory factory = new VaultFactory(owner, factoryFeeRecipient, 0);
 
-## Fee model
+// Create a vault: asset, name, symbol, mgmt bps, perf bps, this vault's fee recipient.
+// Caller becomes the vault owner. Here: 2% mgmt, 10% perf.
+address vault = factory.createVault(
+    IERC20(asset), "Yield USDC", "yUSDC", 200, 1000, operatorFeeRecipient
+);
+FeeVault v = FeeVault(vault);
 
-Fees are realized by **minting vault shares to `feeRecipient`** (dilution) — never by pulling raw
-assets out of the vault. There is no owner code path that moves user principal; the owner's only
-economic claim is the accounted fee shares, which redeem pro-rata like any other shares.
+// Deposit assets, receive shares.
+IERC20(asset).approve(vault, amount);
+uint256 shares = v.deposit(amount, msg.sender);
 
-Accrual happens at the start of every `deposit`/`mint`/`withdraw`/`redeem` (before pricing, so
-previews and execution agree) and can also be triggered directly via `harvest()`.
+// Withdraw assets (or redeem shares) back out — never gated.
+uint256 assetsOut = v.redeem(shares, msg.sender, msg.sender);
 
-### Management fee — bounded, time-based on AUM
-
-```
-mgmtFeeAssets = totalAssets * mgmtFeeBps / 10_000 * elapsed / 365 days
+// Optional: checkpoint fees without otherwise interacting.
+v.harvest();
 ```
 
-Linear in time and in AUM. Capped at `MAX_MGMT_FEE_BPS = 500` (5% annual).
+Direct deployment without the factory uses the same constructor the factory calls:
 
-### Performance fee — bounded, on yield above a high-water mark
-
-The high-water mark (`highWaterMark`) is a **per-share price** (scaled by 1e18), seeded at the
-fresh-vault price and ratcheted **up only**. On accrual:
-
-```
-if currentPricePerShare > highWaterMark:
-    profitAssets    = (currentPricePerShare - highWaterMark) * totalSupply / 1e18
-    perfFeeAssets   = profitAssets * perfFeeBps / 10_000
-    highWaterMark   = currentPricePerShare   // ratchet up
+```solidity
+FeeVault v = new FeeVault(
+    IERC20(asset), "Yield USDC", "yUSDC", 200, 1000, operatorFeeRecipient, owner
+);
 ```
 
-Because the mark only ever rises, a **loss followed by a recovery pays no performance fee** until the
-prior peak price is exceeded again — profit is never charged twice. Capped at
-`MAX_PERF_FEE_BPS = 2000` (20%).
-
-Yield itself arrives as asset flowing into the vault (a real strategy returning profit; in tests, a
-direct transfer via `MockYieldSource`). Since 4626 `totalAssets()` reads the vault's asset balance,
-inflows raise the per-share price automatically, and the next accrual charges the performance fee.
-
-## Solvency invariant
-
-`test/FeeVaultInvariant.t.sol` drives a bounded handler over the full lifecycle
-(deposit / mint / withdraw / redeem / external yield / loss / time passage) and asserts:
-
-- **Accounting completeness** — the sum of all share balances (actors + fee recipient) equals
-  `totalSupply()`; the vault never mints shares anywhere else.
-- **Solvency** — the assets owed to every shareholder at the current share price never exceed the
-  assets the vault actually holds.
-
-## Test
-
-```
-forge test
-```
-
-38 tests across unit, factory, v2-feature, and invariant suites: 4626 round-trips and
-proportionality, the inflation attack, management-fee accrual and caps, performance-fee high-water
-behavior (including no double-charge on recovery), owner-cannot-seize-funds, the solvency
-invariants, plus the v2 deposit-cap / pause / fee-increase guards below.
-
-## Improvements (v2)
-
-A hardening + optimization + feature pass over the shipped v1. All v1 tests remain green; the public
-interface is backward-compatible (only additive functions/events/errors were introduced). The
-withdrawal path is untouched by every new guard, so users can always exit.
-
-### Security review
-
-A line-by-line review found **no exploitable bug**. The v1 design is sound: rounding consistently
-favors the vault (fee-share mint floors; `convertTo*` inherit OZ's virtual-share rounding), the
-`_decimalsOffset()` virtual shares defuse the inflation/donation attack, and — crucially —
-`_accrueFees()` runs at the *start* of every deposit/mint/withdraw/redeem. That accrue-before-pricing
-ordering is what closes the timing games the review probed for:
-
-- A depositor cannot front-run a harvest to capture pending yield or dodge dilution — pending fees
-  are charged and the price is re-based *before* their shares are priced.
-- A new depositor entering above the high-water mark is **not** over-charged performance fee on gains
-  they didn't earn, because the HWM is ratcheted to the current price at their entry.
-- A withdrawer cannot skip their share of a pending performance fee — accrual happens before the burn.
-- Enabling/raising the performance fee never retroactively charges past gains: the setter accrues
-  first (re-baselining the HWM), so only future new highs are charged.
-
-Known, accepted limitation (not a bug, unchanged from v1): `previewX`/`maxWithdraw` are computed from
-pre-accrual state, so they can be marginally optimistic between interactions; execution accrues first
-and re-checks limits, so no funds are ever lost — a request simply reverts or returns slightly less.
-
-### Gas (behavior-preserving)
-
-Micro-opts on the accrual path, all provably identical in behavior: fold `10 ** _decimalsOffset()`
-into a compile-time `VIRTUAL_SHARES` constant (drops a runtime `CALL` + `EXP` on funded accruals),
-single-SLOAD the two fee rates, and skip the `highWaterMark` / `lastAccrualTime` SSTOREs when they
-would rewrite the same value.
-
-| Path (fuzz median) | before | after |
-| --- | --- | --- |
-| `harvest` (pure accrual) | 36133 | 35943 |
-
-The deposit/mint paths cost ~2.1k more gas than v1 — an honest, unavoidable cost of the deposit-cap /
-pause feature, which reads the `depositCap` slot inside the now-honored `maxDeposit` check. Storage is
-packed so the pause flag and fee rates share one warm slot; the cap is the only added cold read.
-
-### New features (LP-safety)
-
-1. **Bounded deposit cap** — `setDepositCap(uint256)` (0 == uncapped, the default). `maxDeposit` /
-   `maxMint` are overridden to honor it, so over-cap deposits/mints revert per ERC-4626.
-2. **Deposit-only pause** — `setDepositsPaused(bool)` blocks new deposits/mints (`maxDeposit`/
-   `maxMint` return 0) while leaving withdrawals and redemptions fully available.
-3. **Fee-increase rate limit** — a fee *increase* may not exceed `MAX_FEE_INCREASE_STEP_BPS` (1%) per
-   change and must wait `FEE_INCREASE_COOLDOWN` (7 days) since the previous increase of that fee.
-   Decreases stay instant. This gives LPs time to exit before a fee ever ramps toward its hard cap.
+Run the suite with `forge test` (Foundry, solc 0.8.26).
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).
+
+FeeVault is fee infrastructure, not a yield source. It earns nothing on its own: revenue only exists
+once real assets are deposited and a real strategy produces yield for the performance fee to apply to.
+There are no promised or projected returns here — the numbers above are gas and test results, not
+yield.
+</content>
